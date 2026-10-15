@@ -1,7 +1,7 @@
 """Offline tests for tools/import_muse_cookies_cdp.py.
 
 Uses a local fake CDP websocket and a fake muse2api HTTP server.
-Does not connect to Chrome, ports 9235/9239, or the real API on 18610.
+Does not connect to Chrome, ports 9234/9235/9239, or the real API on 18610.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "tools" / "import_muse_cookies_cdp.py"
@@ -343,11 +344,55 @@ def write_env(directory: str, key: str = KEY) -> str:
     return path
 
 
+class _LoopbackSockets:
+    """Fail the test if this process connects anywhere except loopback."""
+
+    def __enter__(self):
+        import socket as socket_mod
+
+        self._socket_mod = socket_mod
+        self._real = socket_mod.socket
+        self.attempts = []
+        real = self._real
+        attempts = self.attempts
+
+        class GuardSocket(real):
+            def connect(self, address):
+                host = address[0] if isinstance(address, tuple) else str(address)
+                attempts.append(host)
+                if host not in {"127.0.0.1", "::1", "localhost"}:
+                    raise AssertionError(f"non-loopback connect {host}")
+                return super().connect(address)
+
+        socket_mod.socket = GuardSocket
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._socket_mod.socket = self._real
+        return False
+
+
 def run_cli(args: list[str], env_file: str, tmpdir: str) -> subprocess.CompletedProcess:
     cmd = [sys.executable, str(SCRIPT), "--env-file", env_file, "--timeout", "5", *args]
     text = " ".join(cmd)
-    if ":9235" in text or ":9239" in text or ":18610" in text or text.endswith("9235") or " 9235," in text or ",9239" in text:
+    banned = (
+        "127.0.0.1:9234",
+        "127.0.0.1:9235",
+        "127.0.0.1:9239",
+        "127.0.0.1:18610",
+        "localhost:9234",
+        "localhost:9235",
+        "localhost:9239",
+        "localhost:18610",
+        "[::1]:9234",
+        "[::1]:9235",
+        "[::1]:9239",
+        "[::1]:18610",
+    )
+    if any(item in text for item in banned):
         raise AssertionError("test tried to use a real CDP port or the real API")
+    if "--endpoint" not in args and "--ports" not in args:
+        raise AssertionError("test omitted a fake CDP endpoint and would use port 9234")
     env = os.environ.copy()
     env.pop("MUSE2API_KEY", None)
     env["MUSE2API_KEY"] = ENV_SENTINEL
@@ -355,6 +400,10 @@ def run_cli(args: list[str], env_file: str, tmpdir: str) -> subprocess.Completed
     return subprocess.run(
         cmd, cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=20,
     )
+
+
+def url_host(url: str) -> str:
+    return urlparse(url).hostname or ""
 
 
 def assert_clean(test: unittest.TestCase, proc: subprocess.CompletedProcess) -> None:
@@ -365,9 +414,13 @@ def assert_clean(test: unittest.TestCase, proc: subprocess.CompletedProcess) -> 
 
 class ImportTests(unittest.TestCase):
     def test_defaults_do_not_connect(self):
-        self.assertEqual(IMP.DEFAULT_PORTS, (9235, 9239))
+        self.assertEqual(IMP.DEFAULT_ENDPOINT, "http://127.0.0.1:9234")
+        self.assertFalse(hasattr(IMP, "DEFAULT_PORTS"))
         args = IMP.parse_args([])
-        self.assertEqual(args.ports, "9235,9239")
+        self.assertEqual(args.endpoint, "http://127.0.0.1:9234")
+        self.assertEqual(args.ports, "")
+        self.assertNotIn("9235", args.endpoint)
+        self.assertNotIn("9235", args.ports)
         self.assertEqual(args.env_file, "/workspace/muse2api/.env")
         self.assertEqual(args.base, "http://localhost:18610")
         self.assertFalse(args.dry_run)
@@ -392,13 +445,175 @@ class ImportTests(unittest.TestCase):
             with self.assertRaises(IMP.ImportFailure):
                 IMP.load_api_key(os.path.join(tmp, "missing"))
 
-    def test_private_temp_mode_600_and_deleted(self):
-        holder = {}
-        with IMP.private_temp_file() as path:
-            holder["path"] = path
-            self.assertTrue(os.path.isfile(path))
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
-        self.assertFalse(os.path.exists(holder["path"]))
+    def test_loopback_allowlist_is_exact(self):
+        allowed = (
+            "http://localhost:18610",
+            "http://127.0.0.1:9",
+            "http://[::1]:9",
+            "https://localhost/admin/accounts",
+            "ws://127.0.0.1:9/devtools/browser/x",
+            "wss://[::1]:9/devtools/browser/x",
+        )
+        refused = (
+            "http://example.com",
+            "http://8.8.8.8:80",
+            "http://[2001:db8::1]:9",
+            "ws://203.0.113.10:9/devtools/browser/x",
+            "http://127.0.0.2:9",
+            "http://0.0.0.0:9",
+            "http://localhost.evil.com",
+            "http://127.0.0.1.nip.io",
+            "file:///etc/passwd",
+            "file://localhost/etc/passwd",
+        )
+        for url in allowed:
+            IMP.require_loopback(url, "probe")
+        for url in refused:
+            with self.assertRaises(IMP.ImportFailure):
+                IMP.require_loopback(url, "probe")
+
+    def test_refuses_non_loopback_base_without_requests(self):
+        cdp = CDPStack()
+        api = APIStack()
+        try:
+            with _LoopbackSockets() as guard:
+                with self.assertRaises(IMP.ImportFailure) as ctx:
+                    IMP.run(IMP.parse_args([
+                        "--endpoint", cdp.base,
+                        "--base", "http://203.0.113.10:80",
+                        "--label", "nope",
+                        "--env-file", os.path.join(tempfile.gettempdir(), "missing-env"),
+                    ]))
+            self.assertIn("host must be localhost, 127.0.0.1, or ::1", str(ctx.exception))
+            self.assertIn("203.0.113.10", str(ctx.exception))
+            self.assertEqual(guard.attempts, [])
+            self.assertEqual(cdp.http.hits, [])
+            self.assertEqual(cdp.ws.calls, [])
+            self.assertEqual(api.http.records, [])
+            with tempfile.TemporaryDirectory() as tmp:
+                proc = run_cli(
+                    ["--endpoint", cdp.base, "--base", "http://203.0.113.10:80", "--label", "nope"],
+                    write_env(tmp), tmp,
+                )
+            assert_clean(self, proc)
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("host must be localhost, 127.0.0.1, or ::1", proc.stderr)
+            self.assertIn("203.0.113.10", proc.stderr)
+            self.assertNotIn("cookies:", proc.stdout)
+            self.assertNotIn("import:", proc.stdout)
+            self.assertEqual(cdp.http.hits, [])
+            self.assertEqual(cdp.ws.calls, [])
+            self.assertEqual(api.http.records, [])
+        finally:
+            api.stop()
+            cdp.stop()
+
+    def test_refuses_non_loopback_endpoint_without_requests(self):
+        api = APIStack()
+        endpoints = (
+            "http://203.0.113.10:9",
+            "ws://203.0.113.11:9/devtools/browser/x",
+        )
+        try:
+            for endpoint in endpoints:
+                with self.subTest(endpoint=endpoint):
+                    with _LoopbackSockets() as guard:
+                        with self.assertRaises(IMP.ImportFailure) as ctx:
+                            IMP.run(IMP.parse_args([
+                                "--endpoint", endpoint,
+                                "--base", api.base,
+                                "--label", "nope",
+                                "--env-file", os.path.join(tempfile.gettempdir(), "missing-env"),
+                            ]))
+                    self.assertIn("host must be localhost, 127.0.0.1, or ::1", str(ctx.exception))
+                    self.assertIn(url_host(endpoint), str(ctx.exception))
+                    self.assertEqual(guard.attempts, [])
+                    self.assertEqual(api.http.records, [])
+                    with tempfile.TemporaryDirectory() as tmp:
+                        proc = run_cli(
+                            ["--endpoint", endpoint, "--base", api.base, "--label", "nope"],
+                            write_env(tmp), tmp,
+                        )
+                    assert_clean(self, proc)
+                    self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                    self.assertIn("host must be localhost, 127.0.0.1, or ::1", proc.stderr)
+                    self.assertIn(url_host(endpoint), proc.stderr)
+                    self.assertNotIn("cookies:", proc.stdout)
+                    self.assertNotIn("import:", proc.stdout)
+                    self.assertEqual(api.http.records, [])
+        finally:
+            api.stop()
+
+    def test_refuses_remote_websocket_from_loopback_endpoint(self):
+        def setup(server):
+            server.hits = []
+            server.ws_url = "ws://203.0.113.20:9/devtools/browser/remote"
+            server.targets = [{
+                "type": "page",
+                "url": "https://muse.ai/",
+                "webSocketDebuggerUrl": "ws://203.0.113.21:9/devtools/page/remote",
+            }]
+
+        http, _thread = _serve(CDPHttp, setup)
+        api = APIStack()
+        try:
+            base = f"http://127.0.0.1:{http.server_address[1]}"
+            with _LoopbackSockets() as guard:
+                with self.assertRaises(IMP.ImportFailure) as ctx:
+                    IMP.resolve_cdp(base, [], 2)
+            self.assertIn("CDP websocket", str(ctx.exception))
+            self.assertIn("203.0.113.20", str(ctx.exception))
+            self.assertTrue(guard.attempts)
+            self.assertTrue(all(host == "127.0.0.1" for host in guard.attempts))
+            self.assertEqual([path for _, path in http.hits], ["/json/version"])
+            http.hits.clear()
+            with tempfile.TemporaryDirectory() as tmp:
+                proc = run_cli(
+                    ["--endpoint", base, "--base", api.base, "--label", "nope"],
+                    write_env(tmp), tmp,
+                )
+            assert_clean(self, proc)
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("CDP websocket", proc.stderr)
+            self.assertIn("203.0.113.20", proc.stderr)
+            self.assertNotIn("cookies:", proc.stdout)
+            self.assertNotIn("import:", proc.stdout)
+            self.assertEqual([path for _, path in http.hits], ["/json/version"])
+            self.assertEqual(api.http.records, [])
+        finally:
+            api.stop()
+            http.shutdown()
+            http.server_close()
+
+    def test_refuses_remote_page_websocket_from_json_list(self):
+        cdp = CDPStack(browser_fail=True)
+        api = APIStack()
+        try:
+            cdp.http.targets = [{
+                "id": "page-1",
+                "type": "page",
+                "url": "https://muse.ai/",
+                "webSocketDebuggerUrl": "ws://203.0.113.21:9/devtools/page/remote",
+            }]
+            with tempfile.TemporaryDirectory() as tmp:
+                proc = run_cli(
+                    ["--endpoint", cdp.base, "--base", api.base],
+                    write_env(tmp), tmp,
+                )
+            assert_clean(self, proc)
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("CDP websocket", proc.stderr)
+            self.assertIn("203.0.113.21", proc.stderr)
+            self.assertNotIn("import:", proc.stdout)
+            paths = [path for _, path in cdp.http.hits]
+            self.assertIn("/json/version", paths)
+            self.assertIn("/json/list", paths)
+            self.assertEqual(api.http.records, [])
+            self.assertEqual([call["method"] for call in cdp.ws.calls], ["Network.getCookies"])
+            self.assertTrue(all("/devtools/page/" not in call["path"] for call in cdp.ws.calls))
+        finally:
+            api.stop()
+            cdp.stop()
 
     def test_discover_uses_first_live_port(self):
         def setup_first(server):
@@ -627,6 +842,7 @@ class ImportTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 proc = run_cli(
                     [
+                        "--endpoint", "",
                         "--ports",
                         f"{first.http.server_address[1]},{second.http.server_address[1]}",
                         "--base", api.base,

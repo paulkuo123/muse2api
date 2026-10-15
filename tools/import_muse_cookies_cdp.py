@@ -4,6 +4,10 @@
 The browser is attach-only: this process never closes, navigates, or modifies
 tabs, and it does not open a new tab. Output is limited to counts, success or
 failure, and HTTP status. The API key and cookie values are never printed.
+
+The API base, the CDP endpoint, and every webSocketDebuggerUrl must use host
+localhost, 127.0.0.1, or ::1. Any other host is refused before a request that
+could carry the key or cookies.
 """
 from __future__ import annotations
 
@@ -12,10 +16,8 @@ import json
 import math
 import os
 import sys
-import tempfile
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -24,11 +26,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from cdp import CDP, http_json  # noqa: E402
+from cdp import CDP  # noqa: E402
 
 DEFAULT_ENV_FILE = "/workspace/muse2api/.env"
 DEFAULT_BASE = "http://localhost:18610"
-DEFAULT_PORTS = (9235, 9239)
+# Chrome on this machine that is already logged into muse.ai.
+# Port 9235 is a different Chrome and must not be the default.
+DEFAULT_ENDPOINT = "http://127.0.0.1:9234"
 MUSE_COOKIE_URLS = (
     "https://muse.ai/",
     "https://www.muse.ai/",
@@ -40,6 +44,8 @@ ESSENTIAL = (
     "hatch_native_auth_device",
 )
 _SECRET_MIN = 8
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_ALLOWED_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 
 
 class ImportFailure(RuntimeError):
@@ -88,14 +94,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--endpoint",
-        default="",
-        help="CDP websocket URL or http://host:port debug base; "
-        "default probes ports 9235 then 9239",
+        default=DEFAULT_ENDPOINT,
+        help="CDP websocket URL or http://host:port debug base "
+        "(default: http://127.0.0.1:9234). "
+        "Host must be localhost, 127.0.0.1, or ::1. "
+        "Pass an empty string to probe --ports instead.",
     )
     parser.add_argument(
         "--ports",
-        default=",".join(str(p) for p in DEFAULT_PORTS),
-        help="comma-separated CDP ports to try, in order (default: 9235,9239)",
+        default="",
+        help="comma-separated 127.0.0.1 CDP ports, used only when --endpoint is empty",
     )
     parser.add_argument(
         "--base",
@@ -125,6 +133,32 @@ def parse_ports(text: str) -> list[int]:
     if not ports:
         raise ImportFailure("no CDP ports configured")
     return ports
+
+
+def _bracket(host: str) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def require_loopback(url: str, kind: str) -> None:
+    """Reject any URL whose host is not exactly localhost, 127.0.0.1, or ::1.
+
+    Call this before opening a socket. The message names the host only, never
+    a credential, cookie, or response body.
+    """
+    parsed = urlparse(str(url).strip())
+    scheme = (parsed.scheme or "").lower()
+    host = parsed.hostname
+    if scheme not in _ALLOWED_SCHEMES:
+        raise ImportFailure(
+            f"{kind} must be an http(s) or ws(s) URL on localhost, 127.0.0.1, or ::1"
+        )
+    if host not in _LOOPBACK_HOSTS:
+        shown = host if host else "(missing)"
+        raise ImportFailure(
+            f"{kind} host must be localhost, 127.0.0.1, or ::1 (got {shown})"
+        )
 
 
 def load_api_key(path: str) -> str:
@@ -190,46 +224,94 @@ def _cookies_from_message(msg: object) -> list:
     return []
 
 
+def _read_json(url: str, timeout: float):
+    """GET JSON from a loopback URL. Does not follow redirects."""
+    require_loopback(url, "CDP URL")
+    req = urllib.request.Request(url, method="GET")
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.read()
+        except Exception:
+            pass
+        raise OSError("CDP HTTP error") from None
+    except urllib.error.URLError:
+        raise OSError("CDP request failed") from None
+    if not 200 <= status < 300:
+        raise OSError("CDP HTTP error")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise OSError("CDP response was not JSON") from None
+
+
+def _websocket_url(data: object) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    ws = data.get("webSocketDebuggerUrl")
+    if isinstance(ws, str) and ws.startswith(("ws://", "wss://")):
+        return ws
+    return None
+
+
 def discover_cdp(ports: list[int], host: str = "127.0.0.1", timeout: float = 2.0) -> CdpEndpoint:
     """Probe debug ports in order and return the first browser websocket."""
+    require_loopback(f"http://{_bracket(host)}:1/", "CDP endpoint")
     for port in ports:
-        version_url = f"http://{host}:{port}/json/version"
+        version_url = f"http://{_bracket(host)}:{port}/json/version"
         try:
-            data = http_json(version_url, timeout=timeout)
+            data = _read_json(version_url, timeout=timeout)
+        except ImportFailure:
+            raise
         except Exception:
             continue
-        ws = data.get("webSocketDebuggerUrl") if isinstance(data, dict) else None
-        if isinstance(ws, str) and ws.startswith(("ws://", "wss://")):
-            return CdpEndpoint(ws, f"http://{host}:{port}")
+        ws = _websocket_url(data)
+        if ws is None:
+            continue
+        require_loopback(ws, "CDP websocket")
+        return CdpEndpoint(ws, f"http://{_bracket(host)}:{port}")
     raise ImportFailure("CDP endpoint not found")
 
 
 def _http_base_from_ws(ws_url: str) -> str:
+    require_loopback(ws_url, "CDP websocket")
     parsed = urlparse(ws_url)
     if not parsed.hostname or not parsed.port:
         raise ImportFailure("CDP websocket URL is missing a host")
     scheme = "https" if parsed.scheme == "wss" else "http"
-    return f"{scheme}://{parsed.hostname}:{parsed.port}"
+    return f"{scheme}://{_bracket(parsed.hostname)}:{parsed.port}"
 
 
 def resolve_cdp(endpoint: str, ports: list[int], timeout: float) -> CdpEndpoint:
     text = (endpoint or "").strip()
     if not text:
-        return discover_cdp(ports, timeout=min(timeout, 2.0))
+        if ports:
+            return discover_cdp(ports, timeout=min(timeout, 2.0))
+        text = DEFAULT_ENDPOINT
     if text.startswith(("ws://", "wss://")):
+        require_loopback(text, "CDP endpoint")
         return CdpEndpoint(text, _http_base_from_ws(text))
     if text.startswith(("http://", "https://")):
+        require_loopback(text, "CDP endpoint")
         parsed = urlparse(text)
         if not parsed.netloc:
             raise ImportFailure("CDP endpoint is missing a host")
         base = f"{parsed.scheme}://{parsed.netloc}"
+        require_loopback(base, "CDP endpoint")
         try:
-            data = http_json(base.rstrip("/") + "/json/version", timeout=timeout)
+            data = _read_json(base.rstrip("/") + "/json/version", timeout=timeout)
+        except ImportFailure:
+            raise
         except Exception:
             raise ImportFailure("CDP /json/version failed") from None
-        ws = data.get("webSocketDebuggerUrl") if isinstance(data, dict) else None
-        if not isinstance(ws, str) or not ws.startswith(("ws://", "wss://")):
+        ws = _websocket_url(data)
+        if ws is None:
             raise ImportFailure("CDP /json/version has no websocket")
+        require_loopback(ws, "CDP websocket")
         return CdpEndpoint(ws, base)
     if text.isdigit():
         return discover_cdp([int(text)], timeout=min(timeout, 2.0))
@@ -237,6 +319,7 @@ def resolve_cdp(endpoint: str, ports: list[int], timeout: float) -> CdpEndpoint:
 
 
 def _get_cookies(ws_url: str, timeout: float) -> list:
+    require_loopback(ws_url, "CDP websocket")
     client = CDP(ws_url, timeout=timeout)
     try:
         msg = client.send(
@@ -251,16 +334,26 @@ def _get_cookies(ws_url: str, timeout: float) -> list:
 
 def _existing_page_ws(http_base: str, timeout: float) -> str | None:
     """Read /json/list. Does not create, close, or activate a target."""
+    list_url = http_base.rstrip("/") + "/json/list"
+    require_loopback(list_url, "CDP endpoint")
     try:
-        targets = http_json(http_base.rstrip("/") + "/json/list", timeout=timeout)
+        targets = _read_json(list_url, timeout)
+    except ImportFailure:
+        raise
     except Exception:
         return None
     if not isinstance(targets, list):
         return None
-    pages = [
-        t for t in targets
-        if isinstance(t, dict) and t.get("type") == "page" and t.get("webSocketDebuggerUrl")
-    ]
+    pages = []
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        ws = target.get("webSocketDebuggerUrl")
+        if not isinstance(ws, str) or not ws:
+            continue
+        require_loopback(ws, "CDP websocket")
+        if target.get("type") == "page":
+            pages.append(target)
     for target in pages:
         url = str(target.get("url") or "")
         if url.startswith("https://muse.ai") or url.startswith("https://www.muse.ai"):
@@ -276,14 +369,20 @@ def read_muse_cookies(location: CdpEndpoint, timeout: float) -> tuple[dict[str, 
     Attaching to an existing page is read-only: the only CDP method issued is
     Network.getCookies. No target is created and nothing is navigated.
     """
+    require_loopback(location.ws_url, "CDP websocket")
+    require_loopback(location.http_base, "CDP endpoint")
     try:
         raw = _get_cookies(location.ws_url, timeout)
+    except ImportFailure:
+        raise
     except Exception:
         page_ws = _existing_page_ws(location.http_base, timeout)
         if not page_ws:
             raise ImportFailure("Network.getCookies failed") from None
         try:
             raw = _get_cookies(page_ws, timeout)
+        except ImportFailure:
+            raise
         except Exception:
             raise ImportFailure("Network.getCookies failed") from None
     return filter_muse_cookies(raw)
@@ -295,6 +394,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def post_json(url: str, key: str, payload: dict | None, timeout: float) -> tuple[int, object]:
+    require_loopback(url, "muse2api base")
     body = b"{}" if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -345,26 +445,6 @@ def _test_ok(status: int, parsed: object) -> bool:
     return 200 <= status < 300 and isinstance(parsed, dict) and parsed.get("ok") is True
 
 
-@contextmanager
-def private_temp_file(prefix: str = "muse-cdp-"):
-    """Empty temp file created with umask 077 and mode 600, removed on exit."""
-    old = os.umask(0o077)
-    fd, path = tempfile.mkstemp(prefix=prefix)
-    try:
-        os.fchmod(fd, 0o600)
-        os.close(fd)
-        fd = -1
-        yield path
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        os.umask(old)
-
-
 def _register_cookie_secrets(redactor: Redactor, cookies: dict[str, str]) -> None:
     for value in cookies.values():
         redactor.secret(value)
@@ -374,7 +454,10 @@ def run(args: argparse.Namespace, redactor: Redactor | None = None) -> int:
     out = redactor or Redactor()
     old_umask = os.umask(0o077)
     try:
-        location = resolve_cdp(args.endpoint, parse_ports(args.ports), args.timeout)
+        base = str(args.base or "").strip().rstrip("/")
+        require_loopback(base, "muse2api base")
+        ports = parse_ports(args.ports) if str(args.ports or "").strip() else []
+        location = resolve_cdp(str(args.endpoint or ""), ports, args.timeout)
         cookies, expires = read_muse_cookies(location, args.timeout)
         _register_cookie_secrets(out, cookies)
         out.emit(f"cookies: {len(cookies)}")
@@ -391,7 +474,6 @@ def run(args: argparse.Namespace, redactor: Redactor | None = None) -> int:
             return 3
         key = load_api_key(args.env_file)
         out.secret(key)
-        base = args.base.rstrip("/")
         # Same body as extension/popup.js and tools/muse2api_cookie_importer.user.js.
         payload = {"label": args.label, "cookies": cookies, "expires": expires}
         status, parsed = post_json(base + "/admin/accounts", key, payload, args.timeout)
