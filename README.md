@@ -134,6 +134,39 @@
 2. 新建脚本并将 `tools/muse2api_cookie_importer.user.js` 内容复制粘贴保存。
 3. 打开 [muse.ai](https://muse.ai/) 网页，右下角将出现 **「⚡ 导入到 muse2api」** 悬浮按钮，右键即可配置服务地址与 Key，左键一键推送入库并自动复制剪贴板兜底。
 
+### 方式 C：已登入 Chrome 的 CDP 唯讀匯入（Linux）
+
+Chrome 已經登入 muse.ai，並且開著遠端除錯時，可以用 `tools/import_muse_cookies_cdp.py` 只讀取 **muse.ai** 網域的 Cookie，推送到本機 muse2api，再呼叫管理端測試接口確認帳號可用。
+
+腳本只附著到已經開啟的瀏覽器：不關閉、不導覽、不改分頁，也不會另外開新分頁。終端只輸出 Cookie **數量**、成功或失敗，以及 **HTTP 狀態**，不會印出 `MUSE2API_KEY` 或任何 Cookie 值。
+
+```bash
+# 預設讀 /workspace/muse2api/.env 的 MUSE2API_KEY，
+# 依序嘗試 CDP 埠 9235、9239，匯入 http://localhost:18610
+python tools/import_muse_cookies_cdp.py
+
+# 只讀取並印出數量，不送出
+python tools/import_muse_cookies_cdp.py --dry-run
+
+# 指定除錯端點與金鑰檔
+python tools/import_muse_cookies_cdp.py \
+  --endpoint http://127.0.0.1:9235 \
+  --env-file /workspace/muse2api/.env \
+  --base http://localhost:18610 \
+  --label acc-01
+```
+
+- `--endpoint` 可填 `ws://` 位址或 `http://host:port`。省略時依序探測 `--ports`（預設 `9235,9239`）的 `/json/version`。
+- 透過 CDP `Network.getCookies` 只查詢 `https://muse.ai/` 與 `https://www.muse.ai/`，並只保留網域為 `muse.ai` 的項目。
+- 匯入請求與擴充功能、油猴腳本相同：`POST /admin/accounts`，標頭 `Authorization: Bearer <MUSE2API_KEY>`，JSON 為 `{"label","cookies","expires"}`。
+- 匯入成功後呼叫 `POST /admin/accounts/{id}/test`，依回傳的 `ok` 判斷帳號是否可用。
+
+離線測試（假 CDP 與假 HTTP 服務，不會連線真實 Chrome 或真實 API）：
+
+```bash
+python tests/test_import_muse_cookies_cdp.py
+```
+
 ---
 
 ## 📖 API 调用示例
