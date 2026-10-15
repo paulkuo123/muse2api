@@ -139,6 +139,50 @@
 2. 新建脚本并将 `tools/muse2api_cookie_importer.user.js` 内容复制粘贴保存。
 3. 打开 [muse.ai](https://muse.ai/) 网页，右下角将出现 **「⚡ 导入到 muse2api」** 悬浮按钮，右键即可配置服务地址与 Key，左键一键推送入库并自动复制剪贴板兜底。
 
+### 方式 C：已登入 Chrome 的 CDP 唯讀匯入（Linux）
+
+Chrome 已經登入 muse.ai，並且開著遠端除錯時，可以用 `tools/import_muse_cookies_cdp.py` 只讀取 **muse.ai** 網域的 Cookie，推送到本機 muse2api，再呼叫管理端測試接口確認帳號可用。
+
+腳本只附著到已經開啟的瀏覽器：不關閉、不導覽、不改分頁，也不會另外開新分頁。終端只輸出 Cookie **數量**、成功或失敗，以及 **HTTP 狀態**，不會印出 `MUSE2API_KEY` 或任何 Cookie 值。`--base`、`--endpoint`，以及 Chrome 回傳的 `webSocketDebuggerUrl`，主機都必須是 `localhost`、`127.0.0.1` 或 `::1`，否則直接拒絕，不送出金鑰或 Cookie。
+
+```bash
+# 預設讀 /workspace/muse2api/.env 的 MUSE2API_KEY，
+# 連到已登入 muse.ai 的 Chrome：http://127.0.0.1:9234
+# 匯入 http://localhost:18610
+python3 tools/import_muse_cookies_cdp.py
+
+# 只讀取並印出數量，不送出
+python3 tools/import_muse_cookies_cdp.py --dry-run
+
+# 改連其他本機埠時加上 --endpoint
+python3 tools/import_muse_cookies_cdp.py \
+  --endpoint http://127.0.0.1:9234 \
+  --env-file /workspace/muse2api/.env \
+  --base http://localhost:18610 \
+  --label acc-01
+```
+
+預設端點是 `http://127.0.0.1:9234`（這台機器上已登入 muse.ai 的 Chrome）。不要把 `9235` 當預設，那個埠是另一個 Chrome（Shopee）。要改連別的本機埠，用 `--endpoint` 指定，例如 `--endpoint http://127.0.0.1:9239`。
+
+先確認哪個埠開著 muse.ai，再把那個埠填進 `--endpoint`：
+
+```bash
+curl -s http://127.0.0.1:9234/json/list
+```
+
+在輸出裡找有沒有 `muse.ai` 的網址。沒有的話把埠號換掉再查，例如 `curl -s http://127.0.0.1:9239/json/list`。
+
+- `--endpoint` 可填 `ws://127.0.0.1:埠/...` 或 `http://127.0.0.1:埠`。省略時連 `http://127.0.0.1:9234`。
+- 透過 CDP `Network.getCookies` 只查詢 `https://muse.ai/` 與 `https://www.muse.ai/`，並只保留網域為 `muse.ai` 的項目。
+- 匯入請求與擴充功能、油猴腳本相同：`POST /admin/accounts`，標頭 `Authorization: Bearer <MUSE2API_KEY>`，JSON 為 `{"label","cookies","expires"}`。
+- 匯入成功後呼叫 `POST /admin/accounts/{id}/test`，依回傳的 `ok` 判斷帳號是否可用。
+
+離線測試（假 CDP 與假 HTTP 服務，不會連線真實 Chrome 或真實 API）：
+
+```bash
+python3 tests/test_import_muse_cookies_cdp.py
+```
+
 ---
 
 ## 📖 API 调用示例
@@ -284,7 +328,7 @@ curl -X POST "http://localhost:18610/v1/images/generations" \
 安装项目依赖和 Chromium 后，从仓库根目录运行：
 
 ```bash
-python tests/test_media_selection.py
+python3 tests/test_media_selection.py
 ```
 
 如浏览器不在 PATH，可设置 `MUSE2API_CHROMIUM` 为可执行文件路径。
@@ -310,8 +354,8 @@ python tests/test_media_selection.py
 回归检查（不消耗真实生成额度）：
 
 ```bash
-python tests/test_async_images.py
-python tests/test_vm_wait.py engine.py --assert
+python3 tests/test_async_images.py
+python3 tests/test_vm_wait.py engine.py --assert
 ```
 
 修复共享浏览器异常处理在解锁后重置其他任务的竞争；不再把页面侧栏残留的
@@ -335,7 +379,7 @@ python tests/test_vm_wait.py engine.py --assert
 不使用真实账号、不消耗生成额度的回归测试：
 
 ```bash
-python tests/test_session_health.py
+python3 tests/test_session_health.py
 ```
 # MUSE2API 1.6.1
 
