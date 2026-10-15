@@ -318,9 +318,27 @@ def resolve_cdp(endpoint: str, ports: list[int], timeout: float) -> CdpEndpoint:
     raise ImportFailure("CDP endpoint must be a ws URL, http base, or port")
 
 
+class _LoopbackCDP(CDP):
+    """CDP client that omits the Origin header.
+
+    Chrome rejects DevTools websocket handshakes that carry an Origin header
+    unless it was started with --remote-allow-origins (403 Forbidden). The URL
+    is already restricted to loopback hosts, so dropping Origin is safe here.
+    """
+
+    def __init__(self, ws_url: str, timeout: float = 90.0, max_size: int = 256 << 20):
+        import websocket
+
+        self.ws = websocket.create_connection(
+            ws_url, timeout=timeout, max_size=max_size, suppress_origin=True
+        )
+        self.timeout = timeout
+        self._id = 0
+
+
 def _get_cookies(ws_url: str, timeout: float) -> list:
     require_loopback(ws_url, "CDP websocket")
-    client = CDP(ws_url, timeout=timeout)
+    client = _LoopbackCDP(ws_url, timeout=timeout)
     try:
         msg = client.send(
             "Network.getCookies",

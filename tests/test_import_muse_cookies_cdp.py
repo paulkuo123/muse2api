@@ -861,6 +861,16 @@ class ImportTests(unittest.TestCase):
             first.stop()
 
 
+class OriginHeaderTests(unittest.TestCase):
+    def test_cdp_handshake_suppresses_origin(self):
+        import websocket
+        from unittest import mock
+
+        with mock.patch.object(websocket, "create_connection") as cc:
+            IMP._LoopbackCDP("ws://127.0.0.1:1/devtools/browser/x", timeout=1)
+        self.assertTrue(cc.call_args.kwargs.get("suppress_origin"))
+
+
 if __name__ == "__main__":
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
